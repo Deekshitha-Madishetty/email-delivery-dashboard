@@ -4,112 +4,134 @@ import plotly.graph_objects as go
 
 # --- Page Configuration ---
 st.set_page_config(
-    page_title="Email Delivery Dashboard",
-    page_icon="🚀",
+    page_title="Advanced Email Diagnostics",
+    page_icon="🔬",
     layout="wide"
 )
 
-# --- Hard-coded File Paths and Column Names ---
-# The app will look for these files in the same directory.
-ORIGINAL_FILE_PATH = 'soai_l1_all_cohorts.csv'
-SUCCESSFUL_FILE_PATH = 'total_successfull.csv'
-ORIGINAL_EMAIL_COL = 'email'  # Adjust if your column name is different
-SUCCESSFUL_EMAIL_COL = 'email' # Adjust if your column name is different
+# --- File Configuration ---
+# We now only need 4 files. The app will derive the upload failures.
+CONFIG = {
+    "original":   {"path": "soai_l1_all_cohorts.csv", "col": "email"},
+    "successful": {"path": "total_successfull.csv",   "col": "email"},
+    "soft_bounce":{"path": "soft_bounces.csv",        "col": "email"},
+    "hard_bounce":{"path": "hard_bounces.csv",        "col": "email"}
+}
 
 
-# --- Data Loading and Processing Function ---
-@st.cache_data # This is a powerful Streamlit feature!
-def load_and_process_data():
+# --- Data Loading and Analysis Function ---
+@st.cache_data
+def load_and_diagnose_data():
     """
-    This function loads data from local CSVs, cleans it, and performs the analysis.
-    The @st.cache_data decorator means it only runs ONCE, making the app super fast.
+    Loads all data, cleans it, and assigns a detailed status to each contact,
+    deriving the "Upload Failure" category automatically.
     """
+    dataframes = {}
     try:
-        df_orig = pd.read_csv(ORIGINAL_FILE_PATH)
-        df_succ = pd.read_csv(SUCCESSFUL_FILE_PATH)
+        for key, info in CONFIG.items():
+            dataframes[key] = pd.read_csv(info["path"])
     except FileNotFoundError as e:
         st.error(f"Fatal Error: File not found -> '{e.filename}'.")
-        st.error("Please make sure both 'soai_l1_all_cohorts.csv' and 'total_successfull.csv' are in the same folder as the app.")
-        return None # Return None to indicate failure
+        st.error(f"Please make sure all required CSV files are in the same folder as the app.")
+        return None
 
-    # --- Data Cleaning and Accurate Calculations ---
-    # Clean and get unique emails from the original list
-    df_orig['clean_email'] = df_orig[ORIGINAL_EMAIL_COL].str.strip().str.lower()
+    # --- Create fast lookup sets for each category ---
+    sets = {}
+    for key, df in dataframes.items():
+        col_name = CONFIG[key]["col"]
+        if col_name in df.columns:
+            # Drop NaN values before converting to set
+            sets[key] = set(df[col_name].dropna().str.strip().str.lower())
+        else:
+            st.error(f"Column '{col_name}' not found in '{CONFIG[key]['path']}'")
+            return None
+            
+    # The original list is our "universe" of contacts
+    df_orig = dataframes["original"]
+    df_orig['clean_email'] = df_orig[CONFIG["original"]["col"]].str.strip().str.lower()
     df_orig.drop_duplicates(subset=['clean_email'], inplace=True, keep='first')
 
-    # Create a fast lookup set for successful emails
-    df_succ['clean_email'] = df_succ[SUCCESSFUL_EMAIL_COL].str.strip().str.lower()
-    successful_emails_set = set(df_succ['clean_email'])
-    
-    # Find undelivered contacts
-    undelivered_mask = ~df_orig['clean_email'].isin(successful_emails_set)
-    df_undelivered = df_orig[undelivered_mask]
-    
-    # Calculate final counts based on unique contacts
-    total_unique_count = len(df_orig)
-    undelivered_count = len(df_undelivered)
-    successful_count = total_unique_count - undelivered_count
-    
-    # Return all the necessary data in a dictionary
-    return {
-        "total_unique": total_unique_count,
-        "successful": successful_count,
-        "undelivered": undelivered_count,
-        "undelivered_df": df_undelivered,
-        "original_email_col": ORIGINAL_EMAIL_COL
-    }
+    # --- Categorization Logic with a clear hierarchy ---
+    def get_status(email):
+        if email in sets["successful"]:
+            return "Successful"
+        if email in sets["hard_bounce"]:
+            return "Hard Bounce"
+        if email in sets["soft_bounce"]:
+            return "Soft Bounce"
+        # If an email is not in any of the outcome lists (successful, bounced),
+        # it must have failed to upload into the system. We derive this status.
+        return "Upload Failure (Derived)"
 
-# --- Main App ---
-st.title("🚀 Automatic Email Delivery Dashboard")
+    # Apply the logic to create a new 'status' column
+    df_orig['status'] = df_orig['clean_email'].apply(get_status)
+    return df_orig
 
-# Load and process the data automatically on startup.
-processed_data = load_and_process_data()
 
-# Only display the dashboard if the data was loaded successfully.
-if processed_data:
-    st.header("📈 Delivery Summary")
+# --- Main App UI ---
+st.title("🔬 Advanced Email Delivery Diagnostics")
+st.markdown("This dashboard analyzes your campaign results to categorize every contact, including deriving upload failures.")
+
+# Load and process the data on startup
+final_report = load_and_diagnose_data()
+
+if final_report is not None:
+    status_counts = final_report['status'].value_counts()
+
+    st.header("📈 Overall Campaign Summary")
     
-    # --- Metrics and Visualization ---
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1, 2])
     with col1:
-        st.metric("Total Unique Contacts", f"{processed_data['total_unique']:,}")
-        st.metric("✅ Successful Deliveries", f"{processed_data['successful']:,}")
-        st.metric("❌ Undelivered / Bounced", f"{processed_data['undelivered']:,}", delta_color="inverse")
+        total = len(final_report)
+        successful = status_counts.get("Successful", 0)
+        failures = total - successful
+        
+        st.metric("Total Unique Contacts", f"{total:,}")
+        st.metric("✅ Successful Deliveries", f"{successful:,}")
+        st.metric("❌ Total Failures", f"{failures:,}")
 
     with col2:
         fig = go.Figure(data=[go.Pie(
-            labels=['Successful', 'Undelivered'],
-            values=[processed_data['successful'], processed_data['undelivered']],
-            marker_colors=['#28a745', '#dc3545'],
-            hole=.4
+            labels=status_counts.index,
+            values=status_counts.values,
+            hole=.4,
+            textinfo='label+percent',
+            insidetextorientation='radial'
         )])
-        fig.update_layout(title_text="Delivery Status Overview")
+        fig.update_layout(title_text="Delivery Status Breakdown", legend_title_text='Status')
         st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
     # --- Email Lookup Tool ---
-    st.header("🔍 Email Status Lookup")
-    email_to_check = st.text_input("Enter an email address to check its delivery status:", placeholder="example@domain.com")
+    st.header("🔍 Individual Email Status Lookup")
+    email_to_check = st.text_input("Enter an email address to check its detailed status:", placeholder="example@domain.com")
 
     if email_to_check:
-        undelivered_df = processed_data['undelivered_df']
-        # Check against the 'clean_email' column for accuracy
-        if email_to_check.strip().lower() in undelivered_df['clean_email'].values:
-            st.error(f"**Status: ❌ Not Delivered** - '{email_to_check}' is on the undelivered list.")
+        clean_email = email_to_check.strip().lower()
+        result = final_report[final_report['clean_email'] == clean_email]
+
+        if not result.empty:
+            status = result.iloc[0]['status']
+            if status == "Upload Failure (Derived)":
+                st.error(f"**Status: ❌ Upload Failure (Derived)** - This email was in your original list but was not found in any of the delivery or bounce reports from Brevo.")
+            elif status == "Successful":
+                 st.success(f"**Status: ✅ {status}** - This contact received the email successfully.")
+            else:
+                st.warning(f"**Status: ❌ {status}** - This contact did not receive the email due to a bounce.")
         else:
-            st.success(f"**Status: ✅ Delivered** - '{email_to_check}' was successfully delivered (or was not in your original contact list).")
-    
+            st.info(f"**Status: Can't Find** - The email '{email_to_check}' was not found in the original contact list.")
+
     st.divider()
     
-    # --- Undelivered List Display ---
-    with st.expander("📂 View Full List of Undelivered Contacts"):
-        undelivered_df_display = processed_data['undelivered_df'][[processed_data['original_email_col']]]
-        st.dataframe(undelivered_df_display)
+    # --- Full Report Display ---
+    with st.expander("📂 View and Download Full Diagnostic Report"):
+        report_to_display = final_report[[CONFIG["original"]["col"], 'status']].rename(columns={CONFIG["original"]["col"]: "Email"})
+        st.dataframe(report_to_display)
         
         st.download_button(
-            label="📥 Download Undelivered List as CSV",
-            data=undelivered_df_display.to_csv(index=False).encode('utf-8'),
-            file_name='undelivered_contacts.csv',
+            label="📥 Download Full Report as CSV",
+            data=report_to_display.to_csv(index=False).encode('utf-8'),
+            file_name='full_delivery_diagnostics.csv',
             mime='text/csv',
         )
